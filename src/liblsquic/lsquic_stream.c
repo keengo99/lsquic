@@ -4022,7 +4022,7 @@ lsquic_stream_pwritev (struct lsquic_stream *stream,
 static ssize_t
 stream_write_buf (struct lsquic_stream *stream, const void *buf, size_t sz)
 {
-    const struct iovec iov[1] = {{ (void *) buf, sz, }};
+    const struct iovec iov[1] = {{ .iov_base = (void *) buf, .iov_len = sz, }};
     struct inner_reader_iovec iro = {
         .iov = iov,
         .end = iov + 1,

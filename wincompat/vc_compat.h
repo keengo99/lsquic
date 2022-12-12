@@ -3,18 +3,25 @@
 #include <Windows.h>
 #include <winsock2.h>
 typedef SSIZE_T ssize_t;
-struct iovec {
-  void  *iov_base;    /* Starting address */
-  size_t iov_len;     /* Number of bytes to transfer */
-};
+#ifndef iovec
+#define iovec          _WSABUF
+#define iov_base       buf
+#define iov_len        len
+#endif
+#ifndef strcasecmp
 #define strcasecmp(a,b) _strcmpi(a,b)
+#endif
+#ifndef strncasecmp
 #define strncasecmp _strnicmp
+#endif
+#ifndef strdup
 #define strdup _strdup
+#endif
 #define PATH_MAX MAX_PATH
 
 #define posix_memalign(p, a, s) (((*(p)) = _aligned_malloc((s), (a))), *(p) ?0 :errno)
 
-#pragma warning(disable: 4018 4100 4127 4189 4200 4204 4152 4221 4244 4245 4267 4334 4702 4706 4804 ) 
+#pragma warning(disable: 4018 4100 4127 4189 4200 4204 4152 4221 4244 4245 4267 4334 4702 4706 4804 )
                                     /*
                                     4018:signed/unsigned mismatch
                                     4100:unreferenced formal parameter,
