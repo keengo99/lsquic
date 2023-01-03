@@ -2112,24 +2112,16 @@ lsquic_stream_wantwrite (lsquic_stream_t *stream, int is_want)
     is_want = !!is_want;
 
     SM_HISTORY_APPEND(stream, SHE_WANTWRITE_NO + is_want);
-    if (0 == (stream->stream_flags & STREAM_U_WRITE_DONE)
-                            && SSHS_BEGIN == stream->sm_send_headers_state)
+    if (SSHS_BEGIN == stream->sm_send_headers_state)
     {
         stream->sm_saved_want_write = is_want;
         if (is_want)
             maybe_conn_to_tickable_if_writeable(stream, 1);
         return stream_wantwrite(stream, is_want);
-    }
-    else if (SSHS_BEGIN != stream->sm_send_headers_state)
-    {
+    } else {
         old_val = stream->sm_saved_want_write;
         stream->sm_saved_want_write = is_want;
         return old_val;
-    }
-    else
-    {
-        errno = EBADF;
-        return -1;
     }
 }
 
