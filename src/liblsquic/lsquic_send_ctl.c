@@ -1643,9 +1643,12 @@ static int
 send_ctl_can_send (struct lsquic_send_ctl *ctl)
 {
     const unsigned n_out = send_ctl_all_bytes_out(ctl);
-    LSQ_DEBUG("%s: n_out: %u (unacked_all: %u); cwnd: %"PRIu64, __func__,
+    LSQ_DEBUG("%s: n_out: %u (unacked_all: %u); cwnd: %"PRIu64
+        "; ccfc: %"PRIu64"/%"PRIu64, __func__,
         n_out, ctl->sc_bytes_unacked_all,
-        ctl->sc_ci->cci_get_cwnd(CGP(ctl)));
+        ctl->sc_ci->cci_get_cwnd(CGP(ctl)),
+        ctl->sc_conn_pub->conn_cap.cc_sent,
+        ctl->sc_conn_pub->conn_cap.cc_max);
     if (ctl->sc_flags & SC_PACE)
     {
         if (n_out >= ctl->sc_ci->cci_get_cwnd(CGP(ctl)))
@@ -2346,8 +2349,8 @@ update_for_resending (lsquic_send_ctl_t *ctl, lsquic_packet_out_t *packet_out)
     packno = send_ctl_next_packno(ctl);
 
     packet_out->po_flags &= ~PO_SENT_SZ;
+    assert(packet_out->po_frame_types & ~BQUIC_FRAME_REGEN_MASK);
     packet_out->po_frame_types &= ~BQUIC_FRAME_REGEN_MASK;
-    assert(packet_out->po_frame_types);
     packet_out->po_packno = packno;
     lsquic_packet_out_set_ecn(packet_out, ctl->sc_ecn);
 

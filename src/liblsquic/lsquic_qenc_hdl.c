@@ -515,6 +515,7 @@ qeh_write_headers (struct qpack_enc_hdl *qeh, lsquic_stream_id_t stream_id,
             "%.3f", total_enc_sz, lsquic_frab_list_size(&qeh->qeh_fral),
             *headers_sz, lsqpack_enc_ratio(&qeh->qeh_encoder));
         retval = QWH_PARTIAL;
+        lsquic_stream_wantwrite(qeh->qeh_enc_sm_out, 1);
         goto end;
     }
 
