@@ -1704,16 +1704,23 @@ lsquic_send_ctl_pacer_blocked (struct lsquic_send_ctl *ctl)
 static int
 send_ctl_can_send (struct lsquic_send_ctl *ctl)
 {
+    uint64_t cwnd = ctl->sc_ci->cci_get_cwnd(CGP(ctl));
     const unsigned n_out = send_ctl_all_bytes_out(ctl);
-    LSQ_DEBUG("%s: n_out: %u (unacked_all: %u); cwnd: %"PRIu64
-        "; ccfc: %"PRIu64"/%"PRIu64, __func__,
-        n_out, ctl->sc_bytes_unacked_all,
-        ctl->sc_ci->cci_get_cwnd(CGP(ctl)),
+    LSQ_DEBUG("%s: sc_flags: 0x%X, b_out: %u = (%u + %u); b_retx: %u; cwnd: %"PRIu64
+        "; ccfc: %"PRIu64"/%"PRIu64"; n_scheduled: %d, n_in_flight_all: %d"
+        "; pa_burst: %d; pa_next: %lu; pa_now: %lu"
+        , __func__, ctl->sc_flags,
+        n_out, ctl->sc_bytes_unacked_all, ctl->sc_bytes_scheduled,
+        ctl->sc_bytes_unacked_retx, cwnd,
         ctl->sc_conn_pub->conn_cap.cc_sent,
-        ctl->sc_conn_pub->conn_cap.cc_max);
+        ctl->sc_conn_pub->conn_cap.cc_max,
+        ctl->sc_n_scheduled, ctl->sc_n_in_flight_all,
+        ctl->sc_pacer.pa_burst_tokens,
+        ctl->sc_pacer.pa_next_sched, ctl->sc_pacer.pa_now);
+
     if (ctl->sc_flags & SC_PACE)
     {
-        if (n_out >= ctl->sc_ci->cci_get_cwnd(CGP(ctl)))
+        if (n_out >= cwnd)
             return 0;
         if (lsquic_pacer_can_schedule(&ctl->sc_pacer,
                                ctl->sc_n_scheduled + ctl->sc_n_in_flight_all))
@@ -1728,7 +1735,7 @@ send_ctl_can_send (struct lsquic_send_ctl *ctl)
         return 0;
     }
     else
-        return n_out < ctl->sc_ci->cci_get_cwnd(CGP(ctl));
+        return n_out < cwnd;
 }
 
 
@@ -2132,7 +2139,7 @@ lsquic_send_ctl_next_packet_to_send (struct lsquic_send_ctl *ctl,
     else
         packet_out->po_lflags &= ~POL_LIMITED;
 
-    if (UNLIKELY(!(ctl->sc_conn_pub->lconn->cn_flags & LSCONN_HANDSHAKE_DONE))
+    if (UNLIKELY(packet_out->po_header_type == HETY_INITIAL)
                     && (!(ctl->sc_conn_pub->lconn->cn_flags & LSCONN_SERVER)
                         || (packet_out->po_frame_types
                                                 & IQUIC_FRAME_ACKABLE_MASK))
@@ -2966,6 +2973,52 @@ lsquic_send_ctl_get_packet_for_stream (lsquic_send_ctl_t *ctl,
 }
 
 
+/* Return true if generated, false otherwise */
+int
+lsquic_sendctl_gen_stream_blocked_frame (struct lsquic_send_ctl *ctl,
+                                         struct lsquic_stream *stream)
+{
+    struct lsquic_packet_out *packet_out;
+    const struct parse_funcs *const pf = stream->conn_pub->lconn->cn_pf;
+    unsigned need;
+    uint64_t off;
+    int sz;
+    int is_err;
+
+    off = lsquic_stream_combined_send_off(stream);
+    need = pf->pf_stream_blocked_frame_size(stream->id, off);
+    packet_out = lsquic_send_ctl_get_packet_for_stream(ctl, need,
+                       stream->conn_pub->path, stream);
+    if (!packet_out)
+    {
+        LSQ_DEBUG("failed to get packet_out with lsquic_send_ctl_get_packet_for_stream");
+        packet_out = lsquic_send_ctl_get_writeable_packet(ctl,
+                            PNS_APP, need, stream->conn_pub->path, 0, &is_err);
+        if (!packet_out)
+        {
+            LSQ_DEBUG("cannot get writeable packet for STREAM_BLOCKED frame");
+            return 0;
+        }
+    }
+    sz = pf->pf_gen_stream_blocked_frame(
+                         packet_out->po_data + packet_out->po_data_sz,
+                         lsquic_packet_out_avail(packet_out), stream->id, off);
+    if (sz < 0)
+        return 0;
+    LSQ_DEBUG("generated %d-byte STREAM_BLOCKED "
+        "frame; stream_id: %"PRIu64"; offset: %"PRIu64, sz, stream->id, off);
+    EV_LOG_CONN_EVENT(LSQUIC_LOG_CONN_ID, "generated %d-byte STREAM_BLOCKED "
+        "frame; stream_id: %"PRIu64"; offset: %"PRIu64, sz, stream->id, off);
+    if (0 != lsquic_packet_out_add_frame(packet_out, &ctl->sc_enpub->enp_mm, 0,
+                        QUIC_FRAME_STREAM_BLOCKED, packet_out->po_data_sz, sz))
+        return 0;
+    lsquic_send_ctl_incr_pack_sz(ctl, packet_out, sz);
+    packet_out->po_frame_types |= 1 << QUIC_FRAME_STREAM_BLOCKED;
+    lsquic_stream_blocked_frame_sent(stream);
+    return 1;
+}
+
+
 #ifdef NDEBUG
 static
 #elif __GNUC__
@@ -3775,9 +3828,9 @@ lsquic_send_ctl_resize (struct lsquic_send_ctl *ctl)
                 size = lsquic_packet_out_total_sz(lconn, packet_out);
                 if (size > packet_out->po_path->np_pack_size)
                 {
-                    send_ctl_resize_q(ctl, *q, packet_out->po_path);
                     path_ids |= 1 << packet_out->po_path->np_path_id;
                     q_idxs |= 1 << (q - queues);
+                    send_ctl_resize_q(ctl, *q, packet_out->po_path);
                     goto redo_q;
                 }
             }

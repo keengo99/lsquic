@@ -453,6 +453,7 @@ struct ietf_full_conn
     unsigned                    ifc_n_slack_akbl[N_PNS];
     unsigned                    ifc_n_slack_all;    /* App PNS only */
     unsigned                    ifc_max_retx_since_last_ack;
+    unsigned short              ifc_max_udp_payload;    /* Cached TP */
     lsquic_time_t               ifc_max_ack_delay;
     uint64_t                    ifc_ecn_counts_in[N_PNS][4];
     lsquic_stream_id_t          ifc_max_req_id;
@@ -491,7 +492,8 @@ struct ietf_full_conn
     unsigned                    ifc_max_pack_tol_sent;
 #endif
     unsigned                    ifc_max_ack_freq_seqno; /* Incoming */
-    unsigned short              ifc_max_udp_payload;    /* Cached TP */
+    unsigned short              ifc_min_dg_sz,
+                                ifc_max_dg_sz;
     lsquic_time_t               ifc_last_live_update;
     struct conn_path            ifc_paths[N_PATHS];
     union {
@@ -520,8 +522,6 @@ struct ietf_full_conn
     lsquic_time_t               ifc_ping_period;
     struct lsquic_hash         *ifc_bpus;
     uint64_t                    ifc_last_max_data_off_sent;
-    unsigned short              ifc_min_dg_sz,
-                                ifc_max_dg_sz;
     struct packet_tolerance_stats
                                 ifc_pts;
 #if LSQUIC_CONN_STATS
@@ -755,6 +755,7 @@ blocked_ka_alarm_expired (enum alarm_id al_id, void *ctx,
     struct ietf_full_conn *const conn = (struct ietf_full_conn *) ctx;
     struct lsquic_stream *stream;
     struct lsquic_hash_elem *el;
+    int has_send_flag;
 
     if (lsquic_conn_cap_avail(&conn->ifc_pub.conn_cap) == 0)
     {
@@ -767,13 +768,21 @@ blocked_ka_alarm_expired (enum alarm_id al_id, void *ctx,
                          el = lsquic_hash_next(conn->ifc_pub.all_streams))
     {
         stream = lsquic_hashelem_getdata(el);
-        if (lsquic_stream_is_blocked(stream))
+        if (lsquic_stream_is_blocked(stream)
+            && !lsquic_stream_is_write_reset(stream))
         {
-            if (!(stream->sm_qflags & SMQF_SENDING_FLAGS))
-                TAILQ_INSERT_TAIL(&conn->ifc_pub.sending_streams, stream,
-                                                            next_send_stream);
+            has_send_flag = (stream->sm_qflags & SMQF_SENDING_FLAGS);
             stream->sm_qflags |= SMQF_SEND_BLOCKED;
             LSQ_DEBUG("set SEND_BLOCKED flag on stream %"PRIu64, stream->id);
+            if (!lsquic_sendctl_gen_stream_blocked_frame(
+                        stream->conn_pub->send_ctl, stream))
+            {
+                LSQ_DEBUG("failed to send STREAM_BLOCKED frame for"
+                        " stream %"PRIu64 " immedately, postpone.", stream->id);
+                if (!has_send_flag)
+                    TAILQ_INSERT_TAIL(&conn->ifc_pub.sending_streams, stream,
+                                                            next_send_stream);
+            }
             return;
         }
     }
@@ -1924,7 +1933,7 @@ generate_ack_frame_for_pns (struct ietf_full_conn *conn,
         conn->ifc_flags |= IFC_ACK_HAD_MISS;
     else
         conn->ifc_flags &= ~IFC_ACK_HAD_MISS;
-    LSQ_DEBUG("Put %d bytes of ACK frame into packet %" PRIu64
+    LSQ_DEBUG("Put %d bytes of ACK frame into packet #%" PRIu64
               " on outgoing queue", w, packet_out->po_packno);
     if (conn->ifc_n_cons_unretx >= conn->ifc_ping_unretx_thresh &&
                 !lsquic_send_ctl_have_outgoing_retx_frames(&conn->ifc_send_ctl))
@@ -1935,6 +1944,7 @@ generate_ack_frame_for_pns (struct ietf_full_conn *conn,
         /* This gives a range [12, 27]: */
         conn->ifc_ping_unretx_thresh = 12
                     + lsquic_crand_get_nybble(conn->ifc_enpub->enp_crand);
+        conn->ifc_n_cons_unretx = 0;
     }
 
     conn->ifc_n_slack_akbl[pns] = 0;
@@ -2491,46 +2501,6 @@ generate_max_stream_data_frame (struct ietf_full_conn *conn,
 }
 
 
-/* Return true if generated, false otherwise */
-static int
-generate_stream_blocked_frame (struct ietf_full_conn *conn,
-                                                struct lsquic_stream *stream)
-{
-    struct lsquic_packet_out *packet_out;
-    unsigned need;
-    uint64_t off;
-    int sz;
-
-    off = lsquic_stream_combined_send_off(stream);
-    need = conn->ifc_conn.cn_pf->pf_stream_blocked_frame_size(stream->id, off);
-    packet_out = get_writeable_packet(conn, need);
-    if (!packet_out)
-        return 0;
-    sz = conn->ifc_conn.cn_pf->pf_gen_stream_blocked_frame(
-                         packet_out->po_data + packet_out->po_data_sz,
-                         lsquic_packet_out_avail(packet_out), stream->id, off);
-    if (sz < 0)
-    {
-        ABORT_ERROR("Generating STREAM_BLOCKED frame failed");
-        return 0;
-    }
-    LSQ_DEBUG("generated %d-byte STREAM_BLOCKED "
-        "frame; stream_id: %"PRIu64"; offset: %"PRIu64, sz, stream->id, off);
-    EV_LOG_CONN_EVENT(LSQUIC_LOG_CONN_ID, "generated %d-byte STREAM_BLOCKED "
-        "frame; stream_id: %"PRIu64"; offset: %"PRIu64, sz, stream->id, off);
-    if (0 != lsquic_packet_out_add_frame(packet_out, conn->ifc_pub.mm, 0,
-                        QUIC_FRAME_STREAM_BLOCKED, packet_out->po_data_sz, sz))
-    {
-        ABORT_ERROR("adding frame to packet failed: %d", errno);
-        return 0;
-    }
-    lsquic_send_ctl_incr_pack_sz(&conn->ifc_send_ctl, packet_out, sz);
-    packet_out->po_frame_types |= 1 << QUIC_FRAME_STREAM_BLOCKED;
-    lsquic_stream_blocked_frame_sent(stream);
-    return 1;
-}
-
-
 static int
 generate_stop_sending_frame_by_id (struct ietf_full_conn *conn,
                 lsquic_stream_id_t stream_id, enum http_error_code error_code)
@@ -2915,10 +2885,26 @@ process_stream_ready_to_send (struct ietf_full_conn *conn,
                                             struct lsquic_stream *stream)
 {
     int r = 1;
+
+    LSQ_DEBUG("process_stream_ready_to_send: stream: %"PRIu64", "
+              "sm_qflags: %d. stream_flags: %d, sm_bflags: %d, ", stream->id,
+              stream->sm_qflags, stream->stream_flags, stream->sm_bflags);
+
     if (stream->sm_qflags & SMQF_SEND_MAX_STREAM_DATA)
         r &= generate_max_stream_data_frame(conn, stream);
     if (stream->sm_qflags & SMQF_SEND_BLOCKED)
-        r &= generate_stream_blocked_frame(conn, stream);
+    {
+        if (lsquic_stream_is_write_reset(stream))
+        {
+            stream->sm_qflags &= ~SMQF_SEND_BLOCKED;
+            if (!(stream->sm_qflags & SMQF_SENDING_FLAGS))
+                TAILQ_REMOVE(&stream->conn_pub->sending_streams, stream,
+                             next_send_stream);
+        }
+        else
+            r &= lsquic_sendctl_gen_stream_blocked_frame(&conn->ifc_send_ctl,
+                                                         stream);
+    }
     if (stream->sm_qflags & SMQF_SEND_RST)
         r &= generate_rst_stream_frame(conn, stream);
     if (stream->sm_qflags & SMQF_SEND_STOP_SENDING)
@@ -7316,7 +7302,8 @@ on_dcid_change (struct ietf_full_conn *conn, const lsquic_cid_t *dcid_in)
     struct lsquic_conn *const lconn = &conn->ifc_conn;  /* Shorthand */
     struct conn_cid_elem *cce;
 
-    LSQ_DEBUG("peer switched its DCID, attempt to switch own SCID");
+    LSQ_DEBUGC("peer switched its DCID to %"CID_FMT
+              ", attempt to switch own SCID", CID_BITS(dcid_in));
 
     for (cce = lconn->cn_cces; cce < END_OF_CCES(lconn); ++cce)
         if (cce - lconn->cn_cces != lconn->cn_cur_cce_idx
@@ -7427,6 +7414,7 @@ process_regular_packet (struct ietf_full_conn *conn,
     enum was_missing was_missing;
     int is_rechist_empty;
     unsigned char saved_path_id;
+    int is_dcid_changed;
 
     if (HETY_RETRY == packet_in->pi_header_type)
         return process_retry_packet(conn, packet_in);
@@ -7529,12 +7517,31 @@ process_regular_packet (struct ietf_full_conn *conn,
         }
     }
 
+    is_dcid_changed = !LSQUIC_CIDS_EQ(CN_SCID(&conn->ifc_conn),
+                                        &packet_in->pi_dcid);
     if (pns == PNS_INIT)
         conn->ifc_conn.cn_esf.i->esfi_set_iscid(conn->ifc_conn.cn_enc_session,
                                                                     packet_in);
-    else if (pns == PNS_HSK)
-        lsquic_send_ctl_maybe_calc_rough_rtt(&conn->ifc_send_ctl, pns - 1);
-
+    else
+    {
+        if (is_dcid_changed && HETY_0RTT != packet_in->pi_header_type)
+        {
+            if (LSQUIC_CIDS_EQ(&conn->ifc_conn.cn_cces[0].cce_cid,
+                            &packet_in->pi_dcid)
+                && !(conn->ifc_conn.cn_cces[0].cce_flags & CCE_SEQNO))
+            {
+                ABORT_QUIETLY(0, TEC_PROTOCOL_VIOLATION,
+                            "protocol violation detected bad dcid");
+                return -1;
+            }
+        }
+        if (pns == PNS_HSK)
+        {
+            if ((conn->ifc_flags & (IFC_SERVER | IFC_IGNORE_INIT)) == IFC_SERVER)
+                ignore_init(conn);
+            lsquic_send_ctl_maybe_calc_rough_rtt(&conn->ifc_send_ctl, pns - 1);
+        }
+    }
     EV_LOG_PACKET_IN(LSQUIC_LOG_CONN_ID, packet_in);
 
     is_rechist_empty = lsquic_rechist_is_empty(&conn->ifc_rechist[pns]);
@@ -7558,8 +7565,9 @@ process_regular_packet (struct ietf_full_conn *conn,
                                                     << packet_in->pi_path_id);
                 }
             }
-            else if (!LSQUIC_CIDS_EQ(CN_SCID(&conn->ifc_conn),
-                                                    &packet_in->pi_dcid))
+            else if (is_dcid_changed
+                && !LSQUIC_CIDS_EQ(CN_SCID(&conn->ifc_conn),
+                                   &packet_in->pi_dcid))
             {
                 if (0 != on_dcid_change(conn, &packet_in->pi_dcid))
                     return -1;
@@ -7934,7 +7942,7 @@ ietf_full_conn_ci_packet_sent (struct lsquic_conn *lconn,
     struct ietf_full_conn *const conn = (struct ietf_full_conn *) lconn;
     int s;
 
-    if (packet_out->po_frame_types & (IQUIC_FRAME_RETX_MASK | QUIC_FTBIT_ACK))
+    if (packet_out->po_frame_types & (IQUIC_FRAME_RETX_MASK))
         conn->ifc_n_cons_unretx = 0;
     else
         ++conn->ifc_n_cons_unretx;
@@ -8567,7 +8575,8 @@ ietf_full_conn_ci_tick (struct lsquic_conn *lconn, lsquic_time_t now)
                     || 0 != lsquic_send_ctl_n_scheduled(&conn->ifc_send_ctl))
                 )
         {
-            RETURN_IF_OUT_OF_PACKETS();
+            /* CONNECTION_CLOSE frame should not be congestion controlled.
+            RETURN_IF_OUT_OF_PACKETS(); */
             generate_connection_close_packet(conn);
             tick |= TICK_SEND|TICK_CLOSE;
         }
