@@ -27,7 +27,7 @@ extern "C" {
 
 #define LSQUIC_MAJOR_VERSION 4
 #define LSQUIC_MINOR_VERSION 0
-#define LSQUIC_PATCH_VERSION 9
+#define LSQUIC_PATCH_VERSION 12
 
 /**
  * Engine flags:
@@ -1437,6 +1437,12 @@ lsquic_engine_packet_in (lsquic_engine_t *,
         const unsigned char *packet_in_data, size_t packet_in_size,
         const struct sockaddr *sa_local, const struct sockaddr *sa_peer,
         void *peer_ctx, int ecn);
+
+/**
+ * Returns current number of connections processed by the engine. Both mini and full connections included
+ */
+unsigned
+lsquic_engine_get_conns_count (lsquic_engine_t *engine);
 
 /**
  * Process tickable connections.  This function must be called often enough so
